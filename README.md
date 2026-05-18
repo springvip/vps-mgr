@@ -14,7 +14,7 @@
 | 安全防护 | Fail2Ban、SSH 端口修改、iptables 防火墙、CN IP 封禁 |
 | 代理服务 | Snell v5、Shadowsocks-Rust、SOCKS5 |
 | 流量转发 | Realm 智能转发、链式中转、存活检测 |
-| 监控告警 | Telegram 推送、SSH 登录通知、TCPing 监控、流量配额告警 |
+| 监控告警 | Telegram 推送、SSH 登录通知、Nezha 探针丢包监测（TCPing）、流量配额告警 |
 
 ---
 
@@ -86,7 +86,7 @@ sudo bash ipt_prxy.sh
 4. **XanMod 内核** — 可选安装带 BBR v3 的高性能内核
 5. **网络参数优化** — 根据带宽动态计算 rmem/wmem/BBR 参数，写入 sysctl
 6. **防火墙** — 初始化 iptables DROP 策略，放行 SSH/HTTP/HTTPS 及代理端口
-7. **TCPing 监控** — 部署 TCPing 监控服务，通过 Telegram 上报端口存活
+7. **TCPing 监控** — 部署 TCPing 监控服务，专用于监测 Nezha 探针入口的丢包情况，异常时通过 Telegram 告警
 
 ### 2. Fail2Ban & SSH 安全（选项 2）
 
@@ -129,7 +129,7 @@ sudo bash ipt_prxy.sh
 - 查看 / 修改 BBR 拥塞控制参数
 - 系统清理（清除旧内核、apt 缓存）
 - 调整 TCP 缓冲区大小（按实际带宽动态计算）
-- TCPing 监控管理（安装、修改端口、卸载）
+- TCPing 监控管理（安装、修改端口、卸载）— 专用于 Nezha 探针丢包检测
 
 ### 7. Snell 代理（选项 7）
 
