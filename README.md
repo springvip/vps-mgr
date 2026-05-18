@@ -172,7 +172,7 @@ Surge 配置示例（菜单自动生成）：
 
 ### 10. SOCKS5 代理（选项 10）
 
-基于 dante 的 SOCKS5 代理（专供 VPS 监控使用）：
+基于 dante 的 SOCKS5 代理：
 
 - 一键安装 dante-server
 - 自动生成随机用户名/密码
