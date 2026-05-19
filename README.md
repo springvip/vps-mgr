@@ -17,8 +17,14 @@
 
 ## ⚡ 一键启动
 
+**curl（推荐）：**
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/Bud668/VPS-Proxy-Suite/main/ipt_prxy.sh)
+```
+
+**wget（无 curl 的新机器）：**
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/Bud668/VPS-Proxy-Suite/main/ipt_prxy.sh)
 ```
 
 > 需要 root 权限，支持 Debian 10+ / Ubuntu 20.04+
