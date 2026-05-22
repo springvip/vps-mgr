@@ -26,7 +26,7 @@ readonly UPDATE_CHECK_CACHE="$WORK_DIR/update_check.cache"
 readonly UPDATE_CHECK_INTERVAL=86400
 readonly RAND_PORT_MIN=10000
 readonly RAND_PORT_MAX=65535
-readonly DATA_MAX_LINES=86400
+readonly DATA_MAX_LINES=500000
 readonly ULIMIT_NOFILE=51200
 
 # 变量初始化
@@ -272,6 +272,11 @@ pause() {
 
 open_firewall_port() {
     local port=$1
+    # 端口合法性校验，防止空值或非法参数静默失败
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+        echo -e "${RED}错误: open_firewall_port 收到无效端口: '${port}'${NC}" >&2
+        return 1
+    fi
     msg_step "配置防火墙开放端口 ${port}..."
     if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
         ufw allow "$port" >/dev/null
@@ -280,9 +285,10 @@ open_firewall_port() {
         firewall-cmd --permanent --add-port="${port}/udp" &>/dev/null
         firewall-cmd --reload &>/dev/null
     elif command -v iptables &>/dev/null; then
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT &>/dev/null || iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT &>/dev/null || iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT
-        
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT &>/dev/null || \
+            iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT || { echo -e "${RED}错误: iptables 开放 TCP ${port} 失败${NC}" >&2; return 1; }
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT &>/dev/null || \
+            iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT || { echo -e "${RED}错误: iptables 开放 UDP ${port} 失败${NC}" >&2; return 1; }
         # 优先使用 netfilter-persistent 保存
         if command -v netfilter-persistent &>/dev/null; then
             netfilter-persistent save >/dev/null 2>&1
@@ -295,7 +301,10 @@ open_firewall_port() {
 
 close_firewall_port() {
     local port=$1
-
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+        echo -e "${RED}错误: close_firewall_port 收到无效端口: '${port}'${NC}" >&2
+        return 1
+    fi
     if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
         ufw delete allow "$port" >/dev/null
     elif systemctl is-active --quiet firewalld; then
@@ -303,14 +312,19 @@ close_firewall_port() {
         firewall-cmd --permanent --remove-port="${port}/udp" &>/dev/null
         firewall-cmd --reload &>/dev/null
     elif command -v iptables &>/dev/null; then
-        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT &>/dev/null || true
-        iptables -D INPUT -p udp --dport "$port" -j ACCEPT &>/dev/null || true
-        
-        if command -v netfilter-persistent &>/dev/null; then
-            netfilter-persistent save >/dev/null
-        else
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        local _deleted=0
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT &>/dev/null && \
+            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT &>/dev/null && _deleted=1 || true
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT &>/dev/null && \
+            iptables -D INPUT -p udp --dport "$port" -j ACCEPT &>/dev/null && _deleted=1 || true
+        # 仅在实际删除了规则时才持久化，避免无意义写入
+        if [[ $_deleted -eq 1 ]]; then
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save >/dev/null 2>&1
+            else
+                mkdir -p /etc/iptables
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null
+            fi
         fi
     fi
     printf "${C_GREEN}已尝试删除防火墙规则 (Port: %s)${C_RESET}\n" "$port"
@@ -647,11 +661,16 @@ _tg_send_chunk() {
 
 _tg_edit_keyboard() {
     local msg_id="$1" keyboard_json="$2"
-    curl -s -m 10 \
-        "https://api.telegram.org/bot${TG_BOT_TOKEN}/editMessageReplyMarkup" \
-        -H 'Content-Type: application/json' \
-        -d "{\"chat_id\":\"${TG_CHAT_ID}\",\"message_id\":${msg_id},\"reply_markup\":{\"inline_keyboard\":${keyboard_json}}}" \
-        >/dev/null 2>&1 || true
+    local _attempt
+    for _attempt in 1 2; do
+        curl -s -m 8 \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/editMessageReplyMarkup" \
+            -H 'Content-Type: application/json' \
+            -d "{\"chat_id\":\"${TG_CHAT_ID}\",\"message_id\":${msg_id},\"reply_markup\":{\"inline_keyboard\":${keyboard_json}}}" \
+            2>/dev/null | grep -q '"ok":true' && return 0
+        [[ $_attempt -lt 2 ]] && sleep 3
+    done
+    return 0
 }
 
 send_telegram() {
@@ -803,7 +822,7 @@ _safe_iptables_remove_rule() {
     _filtered=$(echo "$_orig" | grep -v "$grep_flag" "$pattern" || true)
     orig_lines=$(echo "$_orig" | wc -l)
     filtered_lines=$(echo "$_filtered" | wc -l)
-    if [ "$orig_lines" -gt 20 ] && [ "$filtered_lines" -lt $(( orig_lines * 50 / 100 )) ]; then
+    if [ "$filtered_lines" -lt $(( orig_lines * 50 / 100 )) ]; then
         echo -e "${RED}错误: 规则过滤结果异常 (${filtered_lines}/${orig_lines} 行)，已中止还原${NC}" >&2
         rm -f "$_tmp" "$_bak"
         return 1
@@ -826,7 +845,18 @@ _persist_iptables() {
     local _save_file="/etc/iptables/rules.v4"
     [ -f /etc/redhat-release ] && _save_file="/etc/sysconfig/iptables"
     mkdir -p "$(dirname "$_save_file")"
-    iptables-save > "$_save_file" || { echo -e "${RED}错误: iptables-save 写入失败${NC}" >&2; return 1; }
+    # 原子写入：先写临时文件再 mv，避免磁盘满/进程被杀时 rules.v4 变空导致重启锁死
+    local _tmp_save
+    _tmp_save=$(mktemp "$(dirname "$_save_file")/.rules-XXXXXX") || {
+        echo -e "${RED}错误: mktemp 失败，无法持久化规则${NC}" >&2; return 1
+    }
+    chmod 600 "$_tmp_save"
+    if ! iptables-save > "$_tmp_save"; then
+        rm -f "$_tmp_save"
+        echo -e "${RED}错误: iptables-save 写入失败${NC}" >&2
+        return 1
+    fi
+    mv "$_tmp_save" "$_save_file"
     if command -v netfilter-persistent &>/dev/null; then
         netfilter-persistent save >/dev/null 2>&1 || true
     elif command -v service &>/dev/null && [ -f /etc/redhat-release ]; then
@@ -1002,6 +1032,25 @@ _apply_nofile_limits() {
     # profile.d fallback: catches any shell not covered by PAM/systemd
     printf 'ulimit -n 512000 2>/dev/null || true\n' > /etc/profile.d/nofile-limits.sh
     chmod 644 /etc/profile.d/nofile-limits.sh
+}
+
+_apply_journald_limits() {
+    local conf="/etc/systemd/journald.conf"
+    [ -f "$conf" ] || return
+    local changed=0
+    _jd_set() {
+        local key="$1" val="$2"
+        if grep -qE "^#?${key}=" "$conf"; then
+            sed -i "s|^#\?${key}=.*|${key}=${val}|" "$conf" && changed=1
+        else
+            printf '%s=%s\n' "$key" "$val" >> "$conf" && changed=1
+        fi
+    }
+    _jd_set SystemMaxUse      100M
+    _jd_set SystemMaxFileSize  20M
+    _jd_set RuntimeMaxUse      20M
+    _jd_set MaxRetentionSec    7day
+    [ "$changed" -eq 1 ] && systemctl restart systemd-journald 2>/dev/null || true
 }
 
 # 写入 sysctl 配置文件（唯一入口，避免双份不一致）
@@ -1286,14 +1335,14 @@ REVERT_EOF
     iptables -A INPUT -i lo -j ACCEPT
     iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-    # SSH 速率限制：60s 内同 IP 超 4 次新连接先 LOG 再 DROP
+    # SSH 速率限制：60s 内同 IP 超 15 次新连接先 LOG 再 DROP
     iptables -A INPUT -p tcp --dport "$ssh_port" -m conntrack --ctstate NEW \
         -m recent --name SSH_RATE --set
     iptables -A INPUT -p tcp --dport "$ssh_port" -m conntrack --ctstate NEW \
-        -m recent --name SSH_RATE --rcheck --seconds 60 --hitcount 5 \
+        -m recent --name SSH_RATE --rcheck --seconds 60 --hitcount 16 \
         -j LOG --log-prefix "SSH-BRUTE: " --log-level 4
     iptables -A INPUT -p tcp --dport "$ssh_port" -m conntrack --ctstate NEW \
-        -m recent --name SSH_RATE --rcheck --seconds 60 --hitcount 5 \
+        -m recent --name SSH_RATE --rcheck --seconds 60 --hitcount 16 \
         -j DROP
     iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
     iptables -A INPUT -p tcp --dport 80 -j ACCEPT
@@ -2144,9 +2193,9 @@ do_system_update() {
 
 do_quick_init() {
     clear
-    echo -e "${L_PURPLE}════ 一键初始化 ════${NC}"
-    echo -e " 执行顺序: ${CYAN}关闭IPv6${NC} → ${CYAN}系统更新${NC} → ${CYAN}服务器名称${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}防火墙${NC} → ${CYAN}TCPing${NC}"
-    echo -e " 带宽需人工确认，安装内核后需重启以启用 BBR v3"
+    echo -e "${L_PURPLE}══════════════════════ 一键初始化 ══════════════════════${NC}"
+    echo -e "  ${CYAN}IPv6${NC} → ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}防火墙${NC} → ${CYAN}TG/Fail2Ban${NC} → ${CYAN}TCPing${NC}"
+    echo -e "  带宽须人工确认，安装内核后需重启以启用 BBR v3"
     echo
 
     local _ok_sys=0 _ok_net=0 _ok_fw=0 _ok_f2b=0 _ok_tg=0
@@ -2156,16 +2205,16 @@ do_quick_init() {
 
     # ── [1/5] IPv6 ───────────────────────────────────────────
     local _cur_ipv6=""
-    echo -e "\n${L_BLUE}[1/5] IPv6 配置${NC}"
+    echo -e "\n${L_BLUE}── [1/5] IPv6 配置 ──────────────────────────────────────${NC}"
     if [ -f "/etc/sysctl.d/99-disable-ipv6.conf" ]; then
-        echo -e "  IPv6: ${RED}已禁用（跳过）${NC}"
+        echo -e "  ${GREEN}✓${NC} IPv6: ${RED}已禁用（跳过）${NC}"
     else
         _write_disable_ipv6_conf
-        echo -e "  IPv6: ${RED}已禁用${NC}"
+        echo -e "  ${GREEN}✓${NC} IPv6: ${RED}已禁用${NC}"
     fi
 
     # ── [2/5] 系统更新 & 依赖安装 ───────────────────────────
-    echo -e "\n${L_BLUE}[2/5] 系统更新 & 依赖安装${NC}"
+    echo -e "\n${L_BLUE}── [2/5] 系统更新 & 依赖安装 ──────────────────────────${NC}"
 
     if ! check_package_manager_lock; then return; fi
 
@@ -2188,15 +2237,14 @@ do_quick_init() {
     (apt-get update -qq < /dev/null >/dev/null 2>&1) &
     local _upd_pid=$!
     show_spinner $_upd_pid "  更新软件源"
-    wait $_upd_pid && echo -e "  更新软件源: ${GREEN}完成${NC}" || echo -e "  更新软件源: ${YELLOW}失败（继续）${NC}"
+    wait $_upd_pid && echo -e "  ${GREEN}✓ 更新软件源${NC}" || echo -e "  ${YELLOW}⚠ 更新软件源失败（继续）${NC}"
 
     (DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq < /dev/null >/dev/null 2>&1) &
     local _upg_pid=$!
     show_spinner $_upg_pid "  升级系统组件"
-    wait $_upg_pid && echo -e "  升级系统组件: ${GREEN}完成${NC}" || echo -e "  升级系统组件: ${YELLOW}部分失败（继续）${NC}"
+    wait $_upg_pid && echo -e "  ${GREEN}✓ 升级系统组件${NC}" || echo -e "  ${YELLOW}⚠ 升级系统组件部分失败（继续）${NC}"
 
-    echo -e "  ${CYAN}--- 依赖检查 ---${NC}"
-    local _to_install=() _pkg
+    local _to_install=() _pkg _qi_installed=0 _qi_notfound=0
     if apt-cache show software-properties-common >/dev/null 2>&1; then
         if ! dpkg-query -W -f='${Status}' "software-properties-common" 2>/dev/null | grep -q "ok installed"; then
             _to_install+=("software-properties-common")
@@ -2204,35 +2252,38 @@ do_quick_init() {
     fi
     for _pkg in "${_qi_deps[@]}"; do
         if dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null | grep -q "ok installed"; then
-            echo -e "  [${_pkg}]: ${GREEN}已安装${NC}"
+            (( _qi_installed++ )) || true
         elif apt-cache show "$_pkg" >/dev/null 2>&1; then
-            echo -e "  [${_pkg}]: ${YELLOW}缺失（将安装）${NC}"
             _to_install+=("$_pkg")
         else
-            echo -e "  [${_pkg}]: ${CYAN}源中未找到（跳过）${NC}"
+            (( _qi_notfound++ )) || true
         fi
     done
+    local _qi_total=$(( _qi_installed + ${#_to_install[@]} + _qi_notfound ))
 
     local _step_ok=1
-    if [ ${#_to_install[@]} -gt 0 ]; then
-        echo -e "  ${CYAN}--- 安装缺失组件 ---${NC}"
+    if [ ${#_to_install[@]} -eq 0 ]; then
+        echo -e "  ${GREEN}✓ 依赖: 共 ${_qi_total} 个，已全部安装${NC}"
+    else
+        echo -e "  ${CYAN}⟳ 依赖: ${_qi_installed} 已安装，${#_to_install[@]} 待安装: ${_to_install[*]}${NC}"
         (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_to_install[@]}" < /dev/null >/dev/null 2>&1) &
         local _inst_pid=$!
         show_spinner $_inst_pid "  安装中"
         wait $_inst_pid || _step_ok=0
 
-        echo -e "  ${CYAN}--- 安装结果 ---${NC}"
         local _install_fail=0  # H-02: 改名以区分 do_check_all 中的 _fail
         for _pkg in "${_to_install[@]}"; do
-            if dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null | grep -q "ok installed"; then
-                echo -e "  [${_pkg}]: ${GREEN}安装成功${NC}"
-            else
-                echo -e "  [${_pkg}]: ${RED}安装失败${NC}"
+            dpkg-query -W -f='${Status}' "$_pkg" 2>/dev/null | grep -q "ok installed" || \
                 _install_fail=$(( _install_fail + 1 ))
-            fi
         done
-        [ $_install_fail -gt 0 ] && _step_ok=0 && \
-            echo -e "  ${YELLOW}⚠ ${_install_fail} 个组件失败，建议手动: apt-get install -y ${_to_install[*]}${NC}"
+        local _install_ok=$(( ${#_to_install[@]} - _install_fail ))
+        if [ $_install_fail -eq 0 ]; then
+            echo -e "  ${GREEN}✓ 安装完成 (${_install_ok}/${#_to_install[@]})${NC}"
+        else
+            _step_ok=0
+            echo -e "  ${RED}✗ 安装完成 ${_install_ok}/${#_to_install[@]}，${_install_fail} 个失败${NC}"
+            echo -e "  ${YELLOW}  建议手动: apt-get install -y ${_to_install[*]}${NC}"
+        fi
     fi
 
     # 依赖装完后获取服务器 IP 和地理信息并写缓存，后续启动直接读缓存无需 curl
@@ -2243,7 +2294,7 @@ do_quick_init() {
             SERVER_IP="$_ip"
             get_geo_info "$_ip" || true
             local _flag; _flag=$(get_flag_emoji "$SERVER_COUNTRY_CODE")
-            echo -e "  公网IP: ${CYAN}${SERVER_IP}${NC}  ${_flag} ${SERVER_COUNTRY_NAME}${SERVER_CITY:+ · ${SERVER_CITY}}"
+            echo -e "  ${GREEN}✓ 公网IP: ${CYAN}${SERVER_IP}${NC}  ${_flag} ${SERVER_COUNTRY_NAME}${SERVER_CITY:+ · ${SERVER_CITY}}"
             mkdir -p "$WORK_DIR"
             {
                 printf 'SERVER_IP=%s\n'           "$SERVER_IP"
@@ -2262,7 +2313,7 @@ do_quick_init() {
     if systemctl list-unit-files iperf3.service &>/dev/null; then
         systemctl stop iperf3 >/dev/null 2>&1 || true
         systemctl disable iperf3 >/dev/null 2>&1 || true
-        echo -e "  ${GREEN}iperf3 服务已禁用 (手动运行模式)${NC}"
+        echo -e "  ${GREEN}✓ iperf3 服务已禁用 (手动运行模式)${NC}"
     fi
 
     # 自动时区设置（根据 IP 地理位置）
@@ -2274,7 +2325,7 @@ do_quick_init() {
     done
     if [[ -n "$_tz" ]]; then
         timedatectl set-timezone "$_tz" >/dev/null 2>&1 && \
-            echo -e "  ${GREEN}时区: 已自动设置为 ${_tz}${NC}" || \
+            echo -e "  ${GREEN}✓ 时区: ${_tz}${NC}" || \
             echo -e "  ${YELLOW}⚠ 时区设置失败: ${_tz}${NC}"
     else
         echo -e "  ${YELLOW}⚠ 时区自动检测失败，当前保持: $(timedatectl show -p Timezone --value 2>/dev/null)${NC}"
@@ -2298,18 +2349,18 @@ EOF
     # 每天 03:00 执行，避免高峰期
     if ! crontab -l 2>/dev/null | grep -q "sync-timezone"; then
         (crontab -l 2>/dev/null || true; echo "0 3 * * * /usr/local/bin/sync-timezone.sh") | crontab -
-        echo -e "  ${GREEN}时区自动同步: 已设置 cron (每天 03:00)${NC}"
+        echo -e "  ${GREEN}✓ 时区自动同步: cron 每天 03:00${NC}"
     else
-        echo -e "  ${GREEN}时区自动同步: cron 已存在，跳过${NC}"
+        echo -e "  ${GREEN}✓ 时区自动同步: cron 已存在${NC}"
     fi
 
     # NTP 时间同步
     if timedatectl show 2>/dev/null | grep -q "NTPSynchronized=yes"; then
-        echo -e "  ${GREEN}NTP 时间同步: 已同步${NC}"
+        echo -e "  ${GREEN}✓ NTP 时间同步: 已同步${NC}"
     else
         if systemctl enable --now systemd-timesyncd >/dev/null 2>&1 && \
            timedatectl set-ntp true >/dev/null 2>&1; then
-            echo -e "  ${GREEN}NTP 时间同步: 已启用 (systemd-timesyncd)${NC}"
+            echo -e "  ${GREEN}✓ NTP 时间同步: 已启用${NC}"
         else
             echo -e "  ${YELLOW}⚠ NTP 时间同步启用失败，请手动检查 systemd-timesyncd${NC}"
         fi
@@ -2318,18 +2369,19 @@ EOF
     _ok_sys=$_step_ok
 
     # ── 服务器名称 ────────────────────────────────────────────
-    echo -ne "\n  服务器名称 (如 🇯🇵SR_JP_Std，回车自动填): "
+    echo -e "\n${L_BLUE}── 服务器名称 ───────────────────────────────────────────${NC}"
+    echo -ne "  名称 (如 🇯🇵SR_JP_Std，回车自动填): "
     read -r _init_srv_name < /dev/tty || true
 
     # ── [3/5] XanMod 内核安装 (BBR v3) ──────────────────────
-    echo -e "\n${L_BLUE}[3/5] XanMod 内核安装 (BBR v3)${NC}"
+    echo -e "\n${L_BLUE}── [3/5] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
     if [ "$(uname -m)" != "x86_64" ]; then
-        echo -e "  ${YELLOW}跳过（XanMod 仅支持 x86_64，当前架构: $(uname -m)）${NC}"
+        echo -e "  ${YELLOW}⚠ 跳过（XanMod 仅支持 x86_64，当前架构: $(uname -m)）${NC}"
         local _arm_bv; _arm_bv=$(_get_bbr_version)
         if [ "$_arm_bv" = "v3" ]; then
-            echo -e "  ${GREEN}当前内核 $(uname -r) 已支持 BBR v3，无需 XanMod${NC}"
+            echo -e "  ${GREEN}✓ 当前内核 $(uname -r) 已支持 BBR v3，无需 XanMod${NC}"
         else
-            echo -e "  ${YELLOW}当前内核 $(uname -r) 支持 BBR ${_arm_bv}，BBR v3 需主线内核 ≥ 6.9${NC}"
+            echo -e "  ${YELLOW}⚠ 当前内核 $(uname -r) 支持 BBR ${_arm_bv}，BBR v3 需主线内核 ≥ 6.9${NC}"
         fi
         _xanmod_done=2
     elif uname -r | grep -qi "xanmod"; then
@@ -2342,21 +2394,17 @@ EOF
             _xanmod_pkg="linux-xanmod-x64v2"; _xanmod_avx="x64v2 (无AVX2)"
         fi
         echo -e "  CPU: ${CYAN}${_xanmod_avx}${NC} → 将安装 ${CYAN}${_xanmod_pkg}${NC}"
-        echo -ne "  安装 XanMod 内核以启用 BBR v3？[Y/n]: "
-        local _xm_ans; read -r _xm_ans < /dev/tty || true
         local _pre_mem_mb _pre_swap_mb
         _pre_mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 1024)
         _pre_swap_mb=$(awk '/SwapTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
-        if [[ "${_xm_ans:-Y}" =~ ^[Nn]$ ]]; then
-            echo -e "  ${YELLOW}跳过（BBR v3 需要此内核）${NC}"
-        elif [ "$_pre_mem_mb" -lt 400 ]; then
+        if [ "$_pre_mem_mb" -lt 400 ]; then
             echo -e "  ${RED}✗ 跳过（物理内存 ${_pre_mem_mb}MB < 400MB，XanMod 启动时会 OOM Panic）${NC}"
             echo -e "  ${CYAN}提示: 升级内存至 512MB+ 后可手动安装${NC}"
         else
             # RAM < 512MB 且无 Swap 时，临时建 512MB Swap 防止安装 OOM
             # 标志文件让 [4/5] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
             if [ "$_pre_mem_mb" -lt 512 ] && [ "$_pre_swap_mb" -eq 0 ]; then
-                echo -e "  ${YELLOW}内存 ${_pre_mem_mb}MB，临时创建 512MB Swap 供安装使用...${NC}"
+                echo -e "  ${YELLOW}⚠ 内存 ${_pre_mem_mb}MB，临时创建 512MB Swap 供安装使用...${NC}"
                 fallocate -l 512M /swapfile 2>/dev/null || \
                     dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
                 chmod 600 /swapfile
@@ -2410,7 +2458,7 @@ EOF
     fi
 
     # ── [4/5] 网络优化 (DNS + Swap + sysctl) ────────────────
-    echo -e "\n${L_BLUE}[4/5] 网络优化 (DNS + sysctl)${NC}"
+    echo -e "\n${L_BLUE}── [4/5] 网络优化 (DNS + sysctl) ──────────────────────${NC}"
     local phys_mem_mb
     phys_mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "1024")
 
@@ -2429,7 +2477,7 @@ nameserver 94.140.14.14
 options timeout:2 attempts:2
 DNSEOF
         chattr +i /etc/resolv.conf 2>/dev/null || true
-        echo -e "  DNS: ${GREEN}8.8.8.8 / 1.1.1.1 / 94.140.14.14 (已锁定)${NC}"
+        echo -e "  ${GREEN}✓ DNS: 8.8.8.8 / 1.1.1.1 / 94.140.14.14 (已锁定)${NC}"
     fi
 
     # Swap（幂等，已存在则跳过）
@@ -2443,7 +2491,7 @@ DNSEOF
     local _port_input; read -r _port_input < /dev/tty || true
     _port_input=$(echo "$_port_input" | tr -d '[:space:]')
     [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -gt 0 ] && bw_mbps=$_port_input
-    echo -e "  端口速度: ${GREEN}${bw_mbps} Mbps${NC}"
+    echo -e "  ${GREEN}✓ 端口速度: ${bw_mbps} Mbps${NC}"
 
     # BBR / 拥塞控制
     if [ "$_xanmod_done" -eq 1 ]; then
@@ -2477,6 +2525,7 @@ DNSEOF
     sysctl -w net.ipv4.route.flush=1 >/dev/null 2>&1 || true
     _apply_conntrack_sysctl "$_P_CONNTRACK_MAX"
     _apply_nofile_limits
+    _apply_journald_limits
 
     _ok_net=1; _net_bw=$bw_mbps; _rmem_mb=$(( _P_RMEM_MAX / 1048576 ))
     echo -e "  ${GREEN}✓ sysctl 写入完成  rmem: ${_rmem_mb}MB  CC: ${_cc}${NC}"
@@ -2518,18 +2567,18 @@ DNSEOF
     fi
 
     # ── [5/5] 防火墙初始化 ──────────────────────────────────
-    echo -e "\n${L_BLUE}[5/5] 防火墙初始化${NC}"
+    echo -e "\n${L_BLUE}── [5/5] 防火墙初始化 ──────────────────────────────────${NC}"
     if command -v iptables >/dev/null 2>&1 && command -v at >/dev/null 2>&1; then
         do_init_firewall --auto
         _ok_fw=1
     else
-        echo -e "  ${YELLOW}iptables/at 未就绪，跳过（请检查步骤 2 的安装结果）${NC}"
+        echo -e "  ${YELLOW}⚠ iptables/at 未就绪，跳过（请检查步骤 2 的安装结果）${NC}"
     fi
 
     # TG 推送配置
-    echo -e "\n${L_BLUE}[+] TG 推送配置${NC}"
+    echo -e "\n${L_BLUE}── [+] TG 推送 ──────────────────────────────────────────${NC}"
     if [[ -f "$TG_CONF" ]] && grep -q "^TG_BOT_TOKEN=" "$TG_CONF" 2>/dev/null; then
-        echo -e "  TG 推送: ${GREEN}已配置（跳过）${NC}"
+        echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
         _ok_tg=1
     else
         echo -ne "  是否现在配置 TG 推送？[Y/n]: "
@@ -2537,72 +2586,79 @@ DNSEOF
         if [[ ! "${_tg_ans}" =~ ^[Nn]$ ]]; then
             _tg_input_tokens "$_init_srv_name" && _ok_tg=1 || true
         else
-            echo -e "  ${YELLOW}跳过（可后续从选项 3 配置）${NC}"
+            echo -e "  ${YELLOW}⚠ 跳过（可后续从选项 3 配置）${NC}"
         fi
     fi
 
     # Fail2Ban 规则配置
-    echo -e "\n${L_BLUE}[+] Fail2Ban${NC}"
+    echo -e "\n${L_BLUE}── [+] Fail2Ban ─────────────────────────────────────────${NC}"
     if [[ -f /etc/fail2ban/jail.d/sshd.conf ]]; then
-        echo -e "  Fail2Ban: ${GREEN}已配置（跳过）${NC}"
+        echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
         _ok_f2b=1
     else
         _install_fail2ban && _ok_f2b=1 || true
     fi
 
     # TCPing 监控（依赖 socat，防火墙就绪后才有意义）
+    echo -e "\n${L_BLUE}── [+] TCPing ────────────────────────────────────────────${NC}"
     if command -v socat &>/dev/null || apt-get install -y -qq socat >/dev/null 2>&1; then
         _tcping_setup_silent
+        if systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null; then
+            local _tp_port; _tp_port=$(grep "^PORT=" "$TCPING_CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "?")
+            echo -e "  ${GREEN}✓ TCPing 已配置 (端口 ${_tp_port})${NC}"
+        else
+            echo -e "  ${YELLOW}⚠ TCPing 未启动${NC}"
+        fi
     else
-        echo -e "  TCPing    ${YELLOW}跳过（socat 不可用）${NC}"
+        echo -e "  ${YELLOW}⚠ 跳过（socat 不可用）${NC}"
     fi
 
     # ── 汇总报告 ─────────────────────────────────────────────
     echo
-    echo -e "${L_PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${L_PURPLE}─────────────────── 初始化汇总 ─────────────────────────${NC}"
     [ $_ok_sys -eq 1 ] \
-        && echo -e "  系统更新  ${GREEN}✓${NC}" \
-        || echo -e "  系统更新  ${RED}✗${NC}"
+        && echo -e "  系统更新    ${GREEN}✓${NC}" \
+        || echo -e "  系统更新    ${RED}✗${NC}"
     if [ "$_xanmod_done" -eq 1 ]; then
-        echo -e "  XanMod    ${GREEN}✓${NC}  ${WHITE}${_xanmod_pkg} 已安装，重启后生效${NC}"
+        echo -e "  XanMod      ${GREEN}✓${NC}   ${WHITE}${_xanmod_pkg} 已安装，重启后生效${NC}"
     elif [ "$_xanmod_done" -eq 2 ]; then
-        echo -e "  XanMod    ${GREEN}✓${NC}  ${WHITE}已运行 $(uname -r | sed 's/-x64v.*//')${NC}"
+        echo -e "  XanMod      ${GREEN}✓${NC}   ${WHITE}已运行 $(uname -r | sed 's/-x64v.*//')${NC}"
     else
-        echo -e "  XanMod    ${YELLOW}跳过${NC}"
+        echo -e "  XanMod      ${YELLOW}跳过${NC}"
     fi
     [ $_ok_net -eq 1 ] \
-        && echo -e "  网络优化  ${GREEN}✓${NC}  ${WHITE}${_net_bw}Mbps  rmem ${_rmem_mb}MB  CC: ${_cc}${NC}" \
-        || echo -e "  网络优化  ${RED}✗${NC}"
+        && echo -e "  网络优化    ${GREEN}✓${NC}   ${WHITE}${_net_bw}Mbps · rmem ${_rmem_mb}MB · CC: ${_cc}${NC}" \
+        || echo -e "  网络优化    ${RED}✗${NC}"
     [ $_ok_fw -eq 1 ] \
-        && echo -e "  防火墙    ${GREEN}✓${NC}" \
-        || echo -e "  防火墙    ${YELLOW}跳过${NC}"
+        && echo -e "  防火墙      ${GREEN}✓${NC}" \
+        || echo -e "  防火墙      ${YELLOW}跳过${NC}"
     [ $_ok_tg -eq 1 ] \
-        && echo -e "  TG 推送   ${GREEN}✓${NC}" \
-        || echo -e "  TG 推送   ${YELLOW}跳过${NC}"
+        && echo -e "  TG 推送     ${GREEN}✓${NC}" \
+        || echo -e "  TG 推送     ${YELLOW}跳过${NC}"
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
         local _fb_banned; _fb_banned=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
-        echo -e "  Fail2Ban  ${GREEN}✓${NC}  ${WHITE}封禁 ${_fb_banned}${NC}"
+        echo -e "  Fail2Ban    ${GREEN}✓${NC}   ${WHITE}封禁 ${_fb_banned} IP${NC}"
     else
-        echo -e "  Fail2Ban  ${YELLOW}跳过${NC}"
+        echo -e "  Fail2Ban    ${YELLOW}跳过${NC}"
     fi
     if systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null; then
         local _tp; _tp=$(grep "^PORT=" "$TCPING_CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "?")
-        echo -e "  TCPing    ${GREEN}✓${NC}  ${WHITE}端口 ${_tp}${NC}"
+        echo -e "  TCPing      ${GREEN}✓${NC}   ${WHITE}端口 ${_tp}${NC}"
     else
-        echo -e "  TCPing    ${YELLOW}跳过${NC}"
+        echo -e "  TCPing      ${YELLOW}跳过${NC}"
     fi
     if [ "$_cc" = "bbr" ]; then
         if [ "$_xanmod_done" -eq 1 ]; then
-            echo -e "  BBR v3    ${CYAN}⟳${NC}  ${WHITE}待重启后生效 (sysctl 已预写入)${NC}"
+            echo -e "  BBR v3      ${CYAN}⟳${NC}   ${WHITE}待重启后生效 (sysctl 已预写入)${NC}"
         elif [ "$_xanmod_done" -eq 2 ]; then
-            echo -e "  BBR v3    ${GREEN}✓${NC}  ${WHITE}已生效 (XanMod 内核)${NC}"
+            echo -e "  BBR v3      ${GREEN}✓${NC}   ${WHITE}已生效 (XanMod 内核)${NC}"
         else
-            echo -e "  BBR       ${GREEN}✓${NC}  ${WHITE}已启用 (原版内核 BBR v1)${NC}"
+            echo -e "  BBR         ${GREEN}✓${NC}   ${WHITE}已启用 (原版内核 BBR v1)${NC}"
         fi
     else
-        echo -e "  BBR       ${RED}✗${NC}  ${WHITE}内核不支持，当前使用 ${_cc}${NC}"
+        echo -e "  BBR         ${RED}✗${NC}   ${WHITE}内核不支持，当前使用 ${_cc}${NC}"
     fi
-    echo -e "${L_PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${L_PURPLE}─────────────────────────────────────────────────────────${NC}"
     # 新安装内核后给出重启提示
     if [ "$_xanmod_done" -eq 1 ]; then
         echo
@@ -2668,7 +2724,10 @@ _f2b_iptables_accept() {
     local _action="$1" _ip="$2"
     if [ "$_action" = "add" ]; then
         iptables -C INPUT -s "$_ip" -m comment --comment "f2b-whitelist" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT 1 -s "$_ip" -m comment --comment "f2b-whitelist" -j ACCEPT
+            iptables -I INPUT 1 -s "$_ip" -m comment --comment "f2b-whitelist" -j ACCEPT || {
+                echo -e "${RED}错误: iptables 白名单添加失败: ${_ip}${NC}" >&2
+                return 1
+            }
     else
         iptables -D INPUT -s "$_ip" -m comment --comment "f2b-whitelist" -j ACCEPT 2>/dev/null || true
     fi
@@ -2678,6 +2737,10 @@ _f2b_apply_all_iptables() {
     [ -f "$F2B_WHITELIST" ] || return 0
     while IFS= read -r _line; do
         [[ -z "$_line" || "$_line" == \#* ]] && continue
+        if ! validate_ip_cidr "$_line"; then
+            echo -e "${YELLOW}⚠ 白名单中无效条目，已跳过: ${_line}${NC}" >&2
+            continue
+        fi
         _f2b_iptables_accept add "$_line"
     done < "$F2B_WHITELIST"
     _persist_iptables
@@ -2800,7 +2863,7 @@ _srv_display() {
         if [[ ${#_cc} -eq 2 && "$_cc" =~ ^[A-Za-z]+$ ]]; then
             _f=$(python3 -c "cc='${_cc^^}'; print(chr(0x1F1E6+ord(cc[0])-65)+chr(0x1F1E6+ord(cc[1])-65),end='')" 2>/dev/null || true)
         fi
-        echo "${_f:+${_f} }#${_n}"
+        echo "${_f:+${_f} }#${_n//-/_}"
     else
         echo "$_n"
     fi
@@ -2872,7 +2935,7 @@ if [[ "$SERVER_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     _cc=$(grep "^SERVER_COUNTRY_CODE=" /opt/proxy-manager/server_info.cache 2>/dev/null | cut -d= -f2- | tr -d '[:space:]"' || true)
     _f=""
     [[ ${#_cc} -eq 2 && "$_cc" =~ ^[A-Za-z]+$ ]] && _f=$(python3 -c "cc='${_cc^^}'; print(chr(0x1F1E6+ord(cc[0])-65)+chr(0x1F1E6+ord(cc[1])-65),end='')" 2>/dev/null || true)
-    SERVER_DISPLAY="${_f:+${_f} }#${SERVER_NAME}"
+    SERVER_DISPLAY="${_f:+${_f} }#${SERVER_NAME//-/_}"
 else
     SERVER_DISPLAY="$SERVER_NAME"
 fi
@@ -2884,7 +2947,7 @@ curl -s --max-time 10 \
     --data-urlencode "text=🚫 #IP已封禁
 服务器: ${SERVER_DISPLAY}
 封禁IP: <code>${IP}</code>
-原因: 登录失败3次，永久封禁
+原因: 登录失败${FAILURES}次 (永久封禁)
 时间: ${ts}" \
     >/dev/null 2>&1 || true
 F2B_EOF
@@ -6014,15 +6077,17 @@ log_result() {
     mkdir -p "$MONITOR_DATA_DIR"
     local data_file
     data_file=$(get_data_file)
-    # 防止 .dat 无限增长：超过 DATA_MAX_LINES 行时裁剪为一半（flock 保证裁剪与追加原子性）
+    # 防止 .dat 无限增长：超过 DATA_MAX_LINES 行时按时间戳裁剪，保留最近 25h 数据
+    # 按时间戳裁剪而非行数，确保无论规则数多少 daily 始终有完整 24h 覆盖
     (
         flock -x -w 5 200 || { msg_warn "写入锁超时，跳过本轮"; return; }
         local _lines
         _lines=$(wc -l < "$data_file" 2>/dev/null || echo 0)
-        if [[ $_lines -gt ${DATA_MAX_LINES:-86400} ]]; then
-            local _trim_tmp
+        if [[ $_lines -gt ${DATA_MAX_LINES:-500000} ]]; then
+            local _trim_tmp _cutoff
             _trim_tmp=$(mktemp)
-            tail -n $(( DATA_MAX_LINES / 2 )) "$data_file" > "$_trim_tmp" \
+            _cutoff=$(( $(date +%s) - 90000 ))
+            awk -F'\t' -v c="$_cutoff" 'NF>=7 && $1+0 >= c' "$data_file" > "$_trim_tmp" \
                 && mv "$_trim_tmp" "$data_file" || rm -f "$_trim_tmp"
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
