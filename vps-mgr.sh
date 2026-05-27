@@ -1,8 +1,8 @@
 #!/bin/bash
-# https://github.com/Bud668/VPS-Proxy-Suite
+# https://github.com/Bud668/xanmod-bbr-optimizer
 # ==============================================================================
-# Server & Proxy Manager (统一版)
-# System Guardian v10.1.0 + Proxy Manager v13.2
+# Server & VPS Manager (统一版)
+# System Guardian v10.1.0 + VPS Manager v13.2
 # ==============================================================================
 
 set -euo pipefail
@@ -18,6 +18,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # ==============================================================================
 
 readonly SCRIPT_VERSION="13.2"
+readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
 readonly CACHE_FILE="$WORK_DIR/server_info.cache"
 readonly CACHE_TTL=86400
@@ -112,7 +113,7 @@ log_message() {
     shift
     local message="$*"
     local timestamp
-    timestamp=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+    timestamp=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
     case "$LOG_LEVEL" in
         DEBUG) ;;
         INFO) [[ "$level" == "DEBUG" ]] && return ;;
@@ -1071,7 +1072,7 @@ _write_sysctl_conf() {
     cat > /etc/sysctl.d/99-custom-tuning.conf <<EOF
 # ============================================================
 # 动态调优 | 带宽: ${bw_mbps}Mbps | RAM: ${phys_mem_mb}MB | RTT基准: 200ms
-# 生成时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+# 生成时间: $(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
 # ============================================================
 
 # --- 拥塞控制 & 队列调度 ---
@@ -1201,7 +1202,7 @@ _harden_sshd() {
         return 0
     fi
     # 备份原始配置
-    cp -f "$_cfg" "${_cfg}.bak.$(TZ=Asia/Shanghai date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    cp -f "$_cfg" "${_cfg}.bak.$(TZ="$TZ_DEFAULT" date +%Y%m%d%H%M%S)" 2>/dev/null || true
     # 幂等写入：先删除所有相关行（含注释行），再追加
     _sshd_set() {
         sed -i -E "/^[[:space:]]*#?[[:space:]]*${1}[[:space:]]/d" "$_cfg"
@@ -1608,7 +1609,8 @@ do_tcping_monitor() {
     fi
     
     echo -e "\n${L_BLUE}[ 操作选项 ]${NC}"
-    echo -e "  ${L_GREEN}1.${NC} 创建/重新配置 TCPing 监控端口"
+    echo -e "  ${L_GREEN}1.${NC} 创建/重新配置 TCPing 监控端口 ${CYAN}(默认 9999)${NC}"
+    echo -e "  ${L_GREEN}4.${NC} 手动指定端口重新安装"
     echo -e "  ${L_GREEN}2.${NC} 停止并移除 TCPing 监控"
     echo -e "  ${L_GREEN}3.${NC} 查看服务状态"
     echo -e "  ${L_GREEN}0.${NC} 返回主菜单"
@@ -1748,6 +1750,95 @@ EOF
             fi
             ;;
         
+        4)
+            # 手动指定端口重新安装
+            if ! command -v socat &>/dev/null; then
+                echo -e "\n${YELLOW}正在安装 socat...${NC}"
+                apt-get update -qq && apt-get install -y -qq socat
+                if ! command -v socat &>/dev/null; then
+                    echo -e "${RED}安装 socat 失败，请手动安装: apt install socat${NC}"; return
+                fi
+                echo -e "${GREEN}✓ socat 已安装${NC}"
+            fi
+
+            if ! id tcping &>/dev/null; then
+                useradd --system --no-create-home --shell /usr/sbin/nologin tcping
+                echo -e "${GREEN}✓ 专用用户 tcping 已创建${NC}"
+            fi
+
+            local monitor_port
+            echo -ne "\n${CYAN}请输入端口号 (1-65535): ${NC}"
+            read -r monitor_port
+            if [[ ! "$monitor_port" =~ ^[0-9]+$ ]] || [[ "$monitor_port" -lt 1 || "$monitor_port" -gt 65535 ]]; then
+                echo -e "${RED}错误: 端口无效${NC}"; return
+            fi
+            if ss -tuln 2>/dev/null | grep -qE ":${monitor_port}[^0-9]"; then
+                echo -e "${RED}错误: 端口 ${monitor_port} 已被占用${NC}"; return
+            fi
+
+            echo -e "\n${CYAN}正在配置 TCPing 监控端口...${NC}"
+
+            systemctl stop "$TCPING_SERVICE_NAME" 2>/dev/null || true
+            systemctl disable "$TCPING_SERVICE_NAME" 2>/dev/null || true
+            pkill -9 -f "socat.*${monitor_port}" 2>/dev/null || true
+
+            if [ -f "$TCPING_CONFIG_FILE" ]; then
+                local old_port
+                old_port=$(grep "^PORT=" "$TCPING_CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)
+                if [ -n "$old_port" ]; then
+                    _safe_iptables_remove_rule "tcping-monitor"
+                fi
+            fi
+
+            cat > "$TCPING_CONFIG_FILE" <<EOF
+# TCPing Monitor Configuration
+PORT=$monitor_port
+EOF
+
+            cat > "/etc/systemd/system/${TCPING_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=TCPing Monitor Port for Nezha Probe
+After=network.target
+
+[Service]
+Type=simple
+User=tcping
+NoNewPrivileges=true
+ExecStart=/usr/bin/socat TCP4-LISTEN:${monitor_port},reuseaddr,fork,max-children=100 EXEC:/bin/true
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+            systemctl daemon-reload 2>/dev/null || true
+            if ! systemctl enable --now "$TCPING_SERVICE_NAME" 2>/dev/null; then
+                echo -e "${RED}✗ 服务启动失败，请检查: journalctl -u $TCPING_SERVICE_NAME${NC}"; return
+            fi
+
+            iptables -I INPUT 1 -p tcp --dport "$monitor_port" \
+                -m connlimit --connlimit-upto 3 --connlimit-mask 32 \
+                -m comment --comment "tcping-monitor-$monitor_port" -j ACCEPT
+
+            _persist_iptables
+
+            sleep 1
+            if systemctl is-active --quiet "$TCPING_SERVICE_NAME"; then
+                echo -e "${GREEN}✓ TCPing 监控服务已启动${NC}"
+                echo -e "\n${L_BLUE}[ 配置完成 ]${NC}"
+                echo -e "   端口: ${GREEN}$monitor_port${NC}"
+                echo -e "   状态: ${GREEN}运行中${NC}"
+                echo -e "\n${CYAN}在哪吒 Dashboard 添加 TCPing 监控:${NC}"
+                local public_ip
+                public_ip=$(get_public_ip)
+                echo -e "   目标: ${GREEN}${public_ip}:${monitor_port}${NC}"
+                echo -e "\n${YELLOW}提示: 此端口仅用于 TCPing 连通性检测，无安全风险${NC}"
+            else
+                echo -e "${RED}✗ 服务启动失败，请检查日志: journalctl -u $TCPING_SERVICE_NAME${NC}"
+            fi
+            ;;
+
         0)
             return
             ;;
@@ -2540,7 +2631,7 @@ DNSEOF
             echo -e "  ${GREEN}✓ qdisc fq maxrate=${_fq_maxrate}mbit(${bw_mbps}Mbps×98%) flow_limit=250 → ${_def_if}${NC}"
             local _rc_local="/etc/rc.local" _rc_tmp
             _rc_tmp=$(mktemp)
-            [ -f "$_rc_local" ] && cp "$_rc_local" "${_rc_local}.bak.$(TZ=Asia/Shanghai date +%Y%m%d%H%M%S)" 2>/dev/null || true
+            [ -f "$_rc_local" ] && cp "$_rc_local" "${_rc_local}.bak.$(TZ="$TZ_DEFAULT" date +%Y%m%d%H%M%S)" 2>/dev/null || true
             {
                 if [ -f "$_rc_local" ]; then
                     head -n 1 "$_rc_local" | grep -qE '^#!' && head -n 1 "$_rc_local" || echo '#!/bin/bash'
@@ -2890,7 +2981,7 @@ done
 
 journalctl -u "$_unit" --follow --lines=0 --output=cat 2>/dev/null \
 | while IFS= read -r line; do
-    ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+    ts=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
     SERVER_DISPLAY=$(_srv_display "$SERVER_NAME")
     if echo "$line" | grep -qE 'Accepted (password|publickey)'; then
         user=$(echo "$line"   | grep -oP 'for \K\S+(?= from)'  | head -1 || true)
@@ -2939,7 +3030,7 @@ if [[ "$SERVER_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
 else
     SERVER_DISPLAY="$SERVER_NAME"
 fi
-ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+ts=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
 curl -s --max-time 10 \
     "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TG_CHAT_ID}" \
@@ -2983,7 +3074,7 @@ EOF
     if systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null; then
         # 发送启动测试消息
         local _ts _alias_display
-        _ts=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+        _ts=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
         if [[ "$_alias" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             local _cc_s _gf=""
             _cc_s=$(grep -E '^SERVER_COUNTRY_CODE=' "$CACHE_FILE" 2>/dev/null | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
@@ -6064,7 +6155,7 @@ _tcping_batch() {
 }
 
 get_data_file() {
-    echo "${MONITOR_DATA_DIR}/$(TZ=Asia/Shanghai date '+%Y-%m-%d').dat"
+    echo "${MONITOR_DATA_DIR}/$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d').dat"
 }
 
 # 写入一行检测记录（TAB 分隔）
@@ -6204,7 +6295,7 @@ run_daemon() {
                                 echo "$_now_ts" > "$_cooldown_file"
                                 _was_notified[$l_port]=1
                                 local _now_str
-                                _now_str=$(TZ=Asia/Shanghai date '+%m-%d %H:%M')
+                                _now_str=$(TZ="$TZ_DEFAULT" date '+%m-%d %H:%M')
                                 send_telegram "🔴 #节点不可达   ${_node_id//[a-zA-Z0-9_]/}#${_node_id//[^a-zA-Z0-9_]/}
 🕐 ${_now_str}
 ━━━━━━━━━━━━━━━━━
@@ -6216,7 +6307,7 @@ run_daemon() {
                         if [[ ${_was_notified[$l_port]:-0} -eq 1 ]]; then
                             _was_notified[$l_port]=0
                             local _now_str
-                            _now_str=$(TZ=Asia/Shanghai date '+%m-%d %H:%M')
+                            _now_str=$(TZ="$TZ_DEFAULT" date '+%m-%d %H:%M')
                             send_telegram "🟢 #节点已恢复   ${_node_id//[a-zA-Z0-9_]/}#${_node_id//[^a-zA-Z0-9_]/}
 🕐 ${_now_str}
 ━━━━━━━━━━━━━━━━━
@@ -6419,8 +6510,8 @@ send_daily_report() {
 
     local _today_file _yesterday_file _combined
     _today_file=$(get_data_file)
-    _yesterday_file="${MONITOR_DATA_DIR}/$(TZ=Asia/Shanghai date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null \
-        || TZ=Asia/Shanghai date -v-1d '+%Y-%m-%d' 2>/dev/null || echo "").dat"
+    _yesterday_file="${MONITOR_DATA_DIR}/$(TZ="$TZ_DEFAULT" date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null \
+        || TZ="$TZ_DEFAULT" date -v-1d '+%Y-%m-%d' 2>/dev/null || echo "").dat"
     _combined=$(mktemp)
     trap "rm -f '$_combined'" RETURN
     [[ -f "$_yesterday_file" ]] && cat "$_yesterday_file" >> "$_combined" 2>/dev/null || true
@@ -6447,9 +6538,9 @@ send_daily_report() {
     node_id=$(get_node_id)
 
     local time_end time_start
-    time_end=$(TZ=Asia/Shanghai date '+%m-%d %H:%M')
-    time_start=$(TZ=Asia/Shanghai date -d "@$since" '+%m-%d %H:%M' 2>/dev/null \
-              || TZ=Asia/Shanghai date -r "$since" '+%m-%d %H:%M' 2>/dev/null || echo "N/A")
+    time_end=$(TZ="$TZ_DEFAULT" date '+%m-%d %H:%M')
+    time_start=$(TZ="$TZ_DEFAULT" date -d "@$since" '+%m-%d %H:%M' 2>/dev/null \
+              || TZ="$TZ_DEFAULT" date -r "$since" '+%m-%d %H:%M' 2>/dev/null || echo "N/A")
 
     local msg_ranking
     msg_ranking="📊 Realm 24h 稳定性排名 ${node_id//[a-zA-Z0-9_]/}#${node_id//[^a-zA-Z0-9_]/}
@@ -6494,14 +6585,26 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 
+    # 计算基于 machine-id 的固定时间槽：UTC+8 10:00–12:00（对应 UTC 02:00–04:00）
+    local _mid _offset _total _hh _mm _ss _hh_cst _on_cal _on_cal_cst
+    _mid=$(cat /etc/machine-id 2>/dev/null || hostname)
+    _offset=$(( 0x$(printf '%s' "$_mid" | md5sum | cut -c1-8) % 7200 ))
+    _total=$(( 7200 + _offset ))
+    _hh=$(( _total / 3600 ))
+    _mm=$(( (_total % 3600) / 60 ))
+    _ss=$(( _total % 60 ))
+    _hh_cst=$(( (_hh + 8) % 24 ))
+    _on_cal=$(printf "*-*-* %02d:%02d:%02d UTC" "$_hh" "$_mm" "$_ss")
+    _on_cal_cst=$(printf "%02d:%02d:%02d" "$_hh_cst" "$_mm" "$_ss")
+
     cat > "${_tmp}/relay-monitor-daily.service" <<EOF
 [Unit]
-Description=Relay Monitor Daily Report - Ranking (20:00 (北京时间))
+Description=Relay Monitor Daily Report - Ranking
 
 [Service]
 Type=oneshot
 ExecStart=/bin/bash "${script_path}" daily
-Environment=TZ=Asia/Shanghai
+Environment=TZ="$TZ_DEFAULT"
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -6510,11 +6613,10 @@ EOF
 
     cat > "${_tmp}/relay-monitor-daily.timer" <<EOF
 [Unit]
-Description=Relay Monitor Daily Ranking Report Timer (20:00 (北京时间))
+Description=Relay Monitor Daily Ranking Report Timer
 
 [Timer]
-OnCalendar=*-*-* 12:00:00 UTC
-RandomizedDelaySec=120
+OnCalendar=${_on_cal}
 Persistent=true
 
 [Install]
@@ -6541,8 +6643,8 @@ EOF
     systemctl restart relay-monitor.service      || msg_warn "启动 relay-monitor.service 失败"
 
     msg_info "守护进程已启动  → relay-monitor.service"
-    msg_info "排名定时器已启动 → relay-monitor-daily.timer (每日 20:00 (北京时间))"
-    printf "\n${C_GREEN}安装完成！24h稳定性排名每日 20:00 (北京时间) 推送到 Telegram。${C_RESET}\n"
+    msg_info "排名定时器已启动 → relay-monitor-daily.timer (每日 ${_on_cal_cst} UTC+8)"
+    printf "\n${C_GREEN}安装完成！24h稳定性排名推送时间: %s UTC+8 (UTC+8 10:00–12:00 随机槽)${C_RESET}\n" "$_on_cal_cst"
 }
 
 uninstall_relay_services() {
@@ -6586,8 +6688,8 @@ show_relay_status() {
 
     local _today_file _yesterday_file _combined
     _today_file=$(get_data_file)
-    _yesterday_file="${MONITOR_DATA_DIR}/$(TZ=Asia/Shanghai date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null \
-        || TZ=Asia/Shanghai date -v-1d '+%Y-%m-%d' 2>/dev/null || echo "").dat"
+    _yesterday_file="${MONITOR_DATA_DIR}/$(TZ="$TZ_DEFAULT" date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null \
+        || TZ="$TZ_DEFAULT" date -v-1d '+%Y-%m-%d' 2>/dev/null || echo "").dat"
     if [[ ! -f "$_today_file" && ! -f "$_yesterday_file" ]]; then
         printf "${C_YELLOW}暂无数据。${C_RESET}\n"
         printf "\n${C_CYAN}按任意键返回...${C_RESET}"; read -rsn1; return
@@ -6733,10 +6835,10 @@ _quota_read_data() {
     local line
     line=$(grep -m1 "^${port}|" "$QUOTA_DATA" 2>/dev/null || true)
     if [[ -z "$line" ]]; then
-        echo "$(TZ=Asia/Shanghai date +%Y-%m) 0 0 0 0 0 -"
+        echo "$(TZ="$TZ_DEFAULT" date +%Y-%m) 0 0 0 0 0 -"
     else
         IFS='|' read -r _ month iptbl_in iptbl_out acc_in acc_out paused pause_reason <<< "$line"
-        echo "${month:-$(TZ=Asia/Shanghai date +%Y-%m)} ${iptbl_in:-0} ${iptbl_out:-0} ${acc_in:-0} ${acc_out:-0} ${paused:-0} ${pause_reason:--}"
+        echo "${month:-$(TZ="$TZ_DEFAULT" date +%Y-%m)} ${iptbl_in:-0} ${iptbl_out:-0} ${acc_in:-0} ${acc_out:-0} ${paused:-0} ${pause_reason:--}"
     fi
 }
 
@@ -6829,8 +6931,8 @@ quota_check_all() {
 
     quota_init
     local cur_month cur_date node_id
-    cur_month=$(TZ=Asia/Shanghai date +%Y-%m)
-    cur_date=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+    cur_month=$(TZ="$TZ_DEFAULT" date +%Y-%m)
+    cur_date=$(TZ="$TZ_DEFAULT" date +%Y-%m-%d)
     node_id=$(get_node_id)
 
     while IFS='|' read -r port alias quota_bytes expiry _bw; do
@@ -6855,7 +6957,7 @@ quota_check_all() {
         # ── 到期7天自动删除 ──────────────────────────────────────────────
         if [[ "$paused" == "1" && "$pause_reason" == "expiry" && "$expiry" != "-" && -n "$expiry" ]]; then
             local _exp_ts _days_since
-            _exp_ts=$(TZ=Asia/Shanghai date -d "$expiry" +%s 2>/dev/null || echo 0)
+            _exp_ts=$(TZ="$TZ_DEFAULT" date -d "$expiry" +%s 2>/dev/null || echo 0)
             _days_since=$(( ( $(date +%s) - _exp_ts ) / 86400 ))
             if (( _days_since >= 7 )); then
                 _quota_auto_delete "$port" "$alias"
@@ -6875,7 +6977,7 @@ quota_check_all() {
         # 到期前1天提醒（每个到期日只推一次）
         if [[ "$expiry" != "-" && -n "$expiry" ]]; then
             local tomorrow
-            tomorrow=$(TZ=Asia/Shanghai date -d "tomorrow" +%Y-%m-%d 2>/dev/null || TZ=Asia/Shanghai date -v+1d +%Y-%m-%d 2>/dev/null || true)
+            tomorrow=$(TZ="$TZ_DEFAULT" date -d "tomorrow" +%Y-%m-%d 2>/dev/null || TZ="$TZ_DEFAULT" date -v+1d +%Y-%m-%d 2>/dev/null || true)
             local _exp_warn_flag="${QUOTA_DIR}/.expwarn_${port}_${expiry}"
             if [[ "$expiry" == "$tomorrow" && ! -f "$_exp_warn_flag" ]]; then
                 _quota_tg_notify "🟡 到期预警 ${node_id//[a-zA-Z0-9_]/}#${node_id//[^a-zA-Z0-9_]/}
@@ -6899,7 +7001,7 @@ quota_check_all() {
         if [[ "${quota_bytes:-0}" -gt 0 ]]; then
             local warn_threshold
             warn_threshold=$(( quota_bytes * 3 / 4 ))
-            local warn_flag="${QUOTA_DIR}/.warned_${port}_$(TZ=Asia/Shanghai date +%Y-%m)"
+            local warn_flag="${QUOTA_DIR}/.warned_${port}_$(TZ="$TZ_DEFAULT" date +%Y-%m)"
             if [[ "$total" -ge "$warn_threshold" && ! -f "$warn_flag" ]]; then
                 local used_h limit_h pct
                 pct=$(( total * 100 / quota_bytes ))
@@ -6932,8 +7034,8 @@ quota_daily_report() {
     [[ ! -f "$QUOTA_CONFIG" ]] && return 0
     quota_init
     local cur_month cur_date node_id
-    cur_month=$(TZ=Asia/Shanghai date +%Y-%m)
-    cur_date=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+    cur_month=$(TZ="$TZ_DEFAULT" date +%Y-%m)
+    cur_date=$(TZ="$TZ_DEFAULT" date +%Y-%m-%d)
     node_id=$(get_node_id)
 
     local msg="📊 配额日报 ${cur_date} ${node_id//[a-zA-Z0-9_]/}#${node_id//[^a-zA-Z0-9_]/}"$'\n'"━━━━━━━━━━━━━━━━━━"$'\n'
@@ -6971,7 +7073,7 @@ quota_daily_report() {
 
         if [[ "$expiry" != "-" && -n "$expiry" ]]; then
             local days_left _exp_ts
-            _exp_ts=$(TZ=Asia/Shanghai date -d "$expiry" +%s 2>/dev/null || echo 0)
+            _exp_ts=$(TZ="$TZ_DEFAULT" date -d "$expiry" +%s 2>/dev/null || echo 0)
             days_left=$(( ( _exp_ts - $(date +%s) ) / 86400 ))
             if (( days_left < 0 )); then
                 msg+="  到期: ${expiry} 🔴 已过期"$'\n'
@@ -7165,7 +7267,7 @@ _quota_pick_port() {
     local _prompt="${1:-请选择端口}"
     local -a _qports=() _qaliases=()
     local _cur_month
-    _cur_month=$(TZ=Asia/Shanghai date +%Y-%m)
+    _cur_month=$(TZ="$TZ_DEFAULT" date +%Y-%m)
 
     while IFS='|' read -r _p _a _qb _exp _bw; do
         [[ "$_p" =~ ^[0-9]+$ ]] || continue
@@ -7435,8 +7537,8 @@ manage_quota_menu() {
         # Show current status table
         quota_init
         local cur_month cur_date
-        cur_month=$(TZ=Asia/Shanghai date +%Y-%m)
-        cur_date=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+        cur_month=$(TZ="$TZ_DEFAULT" date +%Y-%m)
+        cur_date=$(TZ="$TZ_DEFAULT" date +%Y-%m-%d)
         local count=0
 
         printf " ${C_YELLOW}端口   别名           [───进度───] 占比 已用      /配额        到期             状态${C_RESET}\n"
@@ -7467,7 +7569,7 @@ manage_quota_menu() {
 
             if [[ "$expiry" != "-" && -n "$expiry" ]]; then
                 local days_left _exp_ts
-                _exp_ts=$(TZ=Asia/Shanghai date -d "$expiry" +%s 2>/dev/null || echo 0)
+                _exp_ts=$(TZ="$TZ_DEFAULT" date -d "$expiry" +%s 2>/dev/null || echo 0)
                 days_left=$(( ( _exp_ts - $(date +%s) ) / 86400 ))
                 printf " 到期%s(%dd)" "$expiry" "$days_left"
             fi
@@ -7818,7 +7920,7 @@ show_menu() {
 
     clear
     printf '%b\n' "${C_PURPLE}================================================================${C_RESET}"
-    printf '%b\n' "${C_CYAN}    Server & Proxy Manager  ${C_BLUE}&${C_CYAN} Deploy Tool  ${C_YELLOW}v${SCRIPT_VERSION}${C_RESET}"
+    printf '%b\n' "${C_CYAN}    System Guardian  ${C_BLUE}&${C_CYAN} VPS Manager  ${C_YELLOW}v${SCRIPT_VERSION}${C_RESET}"
     printf '%b\n' "${C_PURPLE}================================================================${C_RESET}"
 
     local _srv_name=""
