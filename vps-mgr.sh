@@ -7317,8 +7317,11 @@ _sbx_show_one() {
             local SK_PORT="" SK_USER="" SK_PW="" SK_WL=""
             # shellcheck disable=SC1090
             . "$f"
-            printf "${C_GREEN}socks5://%s:%s@%s:%s${C_RESET}\n" "$SK_USER" "$SK_PW" "$ip" "$SK_PORT"
-            printf "   白名单: %s\n" "${SK_WL:-（空,端口全拒绝）}"
+            printf "${C_GREEN}socks5://%s:%s@%s:%s${C_RESET}" "$SK_USER" "$SK_PW" "$ip" "$SK_PORT"
+            # 白名单为空 = 端口全拒绝：节点看着正常却连不上，唯一线索就在这里，必须提示。
+            # 已配置则不显示 IP —— 占版面，要看去 sing-box 菜单的 SOCKS5 白名单管理。
+            [[ -z "$SK_WL" ]] && printf "   ${C_RED}⚠ 白名单为空，端口全拒绝${C_RESET}"
+            printf "\n"
             ;;
         hy2-*)
             local H_PORT="" H_PW="" H_OBFS="" H_SNI=""
