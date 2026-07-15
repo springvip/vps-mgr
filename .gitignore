@@ -1,0 +1,17 @@
+# Local agent/editor settings
+.claude/
+
+# Runtime artifacts — never commit; may contain tokens, IPs, or node config
+*.log
+*.cache
+*.conf
+*.json
+!package.json
+data/
+state/
+
+# Backups / scratch
+*.bak
+*.orig
+*.swp
+*~
