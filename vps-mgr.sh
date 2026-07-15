@@ -532,13 +532,15 @@ _do_tg_config() {
         _th_qt=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_QUOTA)
         _th_dd=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_DDNS)
 
-        local _ssh_tg_st _relay_st _quota_st
+        local _ssh_tg_st _relay_st _quota_st _ddns_st
         systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null \
             && _ssh_tg_st="${C_GREEN}运行中${C_RESET}" || _ssh_tg_st="[-]"
         systemctl is-active --quiet relay-monitor 2>/dev/null \
             && _relay_st="${C_GREEN}运行中${C_RESET}" || _relay_st="[-]"
         systemctl is-active --quiet quota-check.timer 2>/dev/null \
             && _quota_st="${C_GREEN}运行中${C_RESET}" || _quota_st="[-]"
+        systemctl is-active --quiet "${DDNS_SERVICE_NAME}.timer" 2>/dev/null \
+            && _ddns_st="${C_GREEN}运行中${C_RESET}" || _ddns_st="[-]"
 
         local _d
         _d="${_tok:+${_tok:0:20}...}"; printf "  Token : %s\n\n" "${_d:-未设置}"
@@ -548,7 +550,7 @@ _do_tg_config() {
         printf "  ${C_BLUE}[ 话题群 ]${C_RESET}  %b\n" "${_hub:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ Realm 监控 %b  话题 %b\n" "$_relay_st" "${_th_mon:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ 流量配额   %b  话题 %b\n" "$_quota_st" "${_th_qt:-${C_YELLOW}未设置${C_RESET}}"
-        printf "    └ DDNS          话题 %b\n" "${_th_dd:-${C_YELLOW}未设置${C_RESET}}"
+        printf "    └ DDNS       %b  话题 %b\n" "$_ddns_st" "${_th_dd:-${C_YELLOW}未设置${C_RESET}}"
 
         printf "\n  ${C_GREEN}1.${C_RESET} 设置 Token & Chat ID\n"
         printf "  ${C_GREEN}2.${C_RESET} SSH 监控\n"
