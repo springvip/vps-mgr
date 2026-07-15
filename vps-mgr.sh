@@ -171,6 +171,21 @@ get_flag_emoji() {
     esac
 }
 
+# 渲染服务器展示名。纯 ASCII 名（如 Bread_LA）补国旗；已含 emoji 的（如自动生成的
+# "🇺🇸 United States, Los Angeles"）原样返回，避免重复加旗。
+# $2 非空时再加 # 前缀 —— 那是 Telegram 话题标签，可点击筛选某台机器的消息，
+# 仅用于推送，终端显示不加。
+# 注：SSH 监控脚本内有一份等价的 _srv_display，因其独立运行无法共用。
+_srv_render() {
+    local _n="$1" _tag="${2:-}"
+    if [[ "$_n" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        local _f; _f=$(get_flag_emoji "${SERVER_COUNTRY_CODE:-}")
+        printf '%s%s%s' "${_f:+${_f} }" "${_tag:+#}" "${_n//-/_}"
+    else
+        printf '%s' "$_n"
+    fi
+}
+
 get_latest_github_release() {
     local repo_url=$1
     local fallback_version="${2:-}"
@@ -471,7 +486,7 @@ _tg_notify_configured() {
         [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" || -z "$TG_THREAD_ID" ]] && continue
         printf "  %s: " "$_label"
         _msg="✅ <b>${_label} 通道配置成功</b>
-👤 主机: ${_srv}
+👤 主机: $(_srv_render "$_srv" tag)
 🕒 时间: ${_ts}"
         if send_telegram "$_msg" 2>/dev/null; then
             printf "${C_GREEN}✓ 已送达话题 %s${C_RESET}\n" "$TG_THREAD_ID"
@@ -8475,13 +8490,7 @@ show_menu() {
     [[ -f "${TG_CONF:-}" ]] && _srv_name=$(grep -E '^SERVER_NAME=' "$TG_CONF" 2>/dev/null | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
     printf "${C_BLUE}:: 服务器信息 ::${C_RESET}\n"
     if [[ -n "$_srv_name" ]]; then
-        # 纯 ASCII 名补旗帜，已含 emoji 的原样输出。不加 TG 推送里那个 # ——
-        # 那是 Telegram 话题标签（可点击筛选），终端里没有意义
-        if [[ "$_srv_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            printf "   服务器: %s%s\n" "${flag:+${flag} }" "${_srv_name//-/_}"
-        else
-            printf "   服务器: %s\n" "$_srv_name"
-        fi
+        printf "   服务器: %s\n" "$(_srv_render "$_srv_name")"
     else
         printf "   服务器: %s %s, %s\n" "$flag" "$SERVER_COUNTRY_NAME" "$SERVER_CITY"
     fi
