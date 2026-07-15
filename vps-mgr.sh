@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Server & VPS Manager (统一版)
-# System Guardian v10.1.0 + VPS Manager v13.2
+# https://github.com/springvip/vps-mgr
 # ==============================================================================
 
 set -euo pipefail
@@ -16,7 +16,8 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="13.2"
+readonly SCRIPT_VERSION="1.0.0"
+readonly SELF_REPO="springvip/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
 readonly CACHE_FILE="$WORK_DIR/server_info.cache"
@@ -5271,6 +5272,51 @@ edit_config() {
 
 }
 
+self_update() {
+    local latest tmp_file self_path
+    self_path=$(realpath "${BASH_SOURCE[0]}")
+
+    msg_step "检查脚本更新..."
+    latest=$(get_latest_github_release "$SELF_REPO") || return 1
+    latest="${latest#v}"
+
+    if [[ "$latest" == "$SCRIPT_VERSION" ]]; then
+        msg_success "已是最新版本 v${SCRIPT_VERSION}"
+        return 0
+    fi
+
+    printf "${C_YELLOW}发现新版本: v%s → v%s${C_RESET}\n" "$SCRIPT_VERSION" "$latest"
+    printf "${C_PURPLE}是否更新? [y/N]: ${C_RESET}"
+    local _yn; read -r _yn
+    [[ "${_yn,,}" == "y" ]] || return 0
+
+    # 与脚本同目录建临时文件，确保后续 mv 是同文件系统内的原子替换
+    tmp_file=$(mktemp "${self_path}.XXXXXX") || { msg_error "无法创建临时文件"; return 1; }
+    trap "rm -f '$tmp_file'" RETURN
+
+    if ! curl -fsSL --max-time 60 \
+        "https://raw.githubusercontent.com/${SELF_REPO}/v${latest}/vps-mgr.sh" -o "$tmp_file"; then
+        msg_error "下载失败，请检查网络"
+        return 1
+    fi
+
+    # 语法校验：绝不用损坏的脚本覆盖正在使用的版本
+    if ! bash -n "$tmp_file" 2>/dev/null; then
+        msg_error "新版本语法校验失败，已放弃更新"
+        return 1
+    fi
+
+    cp -p "$self_path" "${self_path}.bak" 2>/dev/null || true
+    chmod +x "$tmp_file"
+    mv "$tmp_file" "$self_path"
+    trap - RETURN
+
+    msg_success "已更新到 v${latest}（旧版备份: ${self_path}.bak）"
+    msg_info "3 秒后重启脚本..."
+    sleep 3
+    exec "$self_path"
+}
+
 _do_update_menu() {
     clear
     printf "${C_BLUE}=== 更新服务 ===${C_RESET}\n\n"
@@ -5308,6 +5354,7 @@ _do_update_menu() {
     fi
 
     printf "\n ${C_GREEN}4.${C_RESET} 一键更新全部有更新的服务\n"
+    printf " ${C_GREEN}5.${C_RESET} 本脚本      ${C_GREEN}v%s${C_RESET}  (检查并更新)\n" "$SCRIPT_VERSION"
     printf " ${C_GREEN}0.${C_RESET} 返回\n"
     printf "\n${C_PURPLE}请选择: ${C_RESET}"
     read -r _upd_ch
@@ -5325,6 +5372,7 @@ _do_update_menu() {
             fi
             [[ $_did -eq 0 ]] && printf "${C_GREEN}所有服务均已是最新版本${C_RESET}\n"
             ;;
+        5) self_update ;;
         0) return ;;
         *) msg_warn "无效选项" ;;
     esac
