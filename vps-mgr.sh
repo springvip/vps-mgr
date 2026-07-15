@@ -7311,14 +7311,12 @@ _sbx_show_one() {
             # shellcheck disable=SC1090
             . "$f"
             u=$(printf '%s:%s' "$S_METHOD" "$S_PW" | base64 -w0 2>/dev/null || true)
-            printf "${C_YELLOW}[%s]${C_RESET} SS\n" "$nm"
             printf "${C_GREEN}ss://%s@%s:%s#%s${C_RESET}\n" "$u" "$ip" "$S_PORT" "$nm"
             ;;
         socks-*)
             local SK_PORT="" SK_USER="" SK_PW="" SK_WL=""
             # shellcheck disable=SC1090
             . "$f"
-            printf "${C_YELLOW}[%s]${C_RESET} SOCKS5\n" "$nm"
             printf "${C_GREEN}socks5://%s:%s@%s:%s${C_RESET}\n" "$SK_USER" "$SK_PW" "$ip" "$SK_PORT"
             printf "   白名单: %s\n" "${SK_WL:-（空,端口全拒绝）}"
             ;;
@@ -7326,7 +7324,6 @@ _sbx_show_one() {
             local H_PORT="" H_PW="" H_OBFS="" H_SNI=""
             # shellcheck disable=SC1090
             . "$f"
-            printf "${C_YELLOW}[%s]${C_RESET} Hysteria2\n" "$nm"
             printf "${C_GREEN}hysteria2://%s@%s:%s/?sni=%s&obfs=salamander&obfs-password=%s&insecure=1#%s${C_RESET}\n" \
                 "$H_PW" "$ip" "$H_PORT" "$H_SNI" "$H_OBFS" "$nm"
             ;;
