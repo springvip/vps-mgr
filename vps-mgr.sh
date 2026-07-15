@@ -1508,8 +1508,9 @@ REVERT_EOF
         -m recent --name SSH_RATE --rcheck --seconds 60 --hitcount 16 \
         -j DROP
     iptables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
-    iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-    iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+    # 不默认放行 80/443：本脚本不签证书（Hy2 用自签证书跑随机高位口），也不跑 web 服务。
+    # 留着只是白给一个例外——万一 apt 顺带装进 nginx 之类，它会立刻暴露在公网。
+    # 需要时用「防火墙规则 → 开放端口」按需开。
     iptables -A INPUT -p icmp --icmp-type 8 -m limit --limit 1/s --limit-burst 3 -j ACCEPT
     # PMTUD: Destination Unreachable (type 3) 和 TTL Exceeded (type 11) 必须放行，
     # 否则 conntrack RELATED 无法覆盖所有 ICMP 错误，导致 MTU 黑洞
@@ -8689,14 +8690,12 @@ show_menu() {
         _ssh_port=$(get_current_ssh_port 2>/dev/null || echo "22")
         printf "   %b端  口%b" "${C_BLUE}" "${C_RESET}"
         _port_dot "$_ssh_port" "SSH"
-        _port_dot "80"  "HTTP"
-        _port_dot "443" "HTTPS"
         printf "\n"
         if [[ "$policy" != "ACCEPT" ]]; then
             local _raw_ports _display_ports=()
             _raw_ports=$(echo "$ir" | grep -E '^-A INPUT.*-j ACCEPT' | grep -oE -- '--dport [0-9]+' | awk '{print $2}' | sort -nu || true)
             for _p in $_raw_ports; do
-                [[ "$_p" == "$_ssh_port" || "$_p" == "80" || "$_p" == "443" ]] && continue
+                [[ "$_p" == "$_ssh_port" ]] && continue
                 _display_ports+=("$_p")
             done
             if [[ ${#_display_ports[@]} -gt 0 ]]; then
