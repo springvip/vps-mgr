@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Server & VPS Manager (统一版)
-# https://github.com/springvip/vps-mgr
+# https://github.com/Bud668/xanmod-bbr-optimizer
 # ==============================================================================
 
 set -euo pipefail
@@ -16,8 +16,8 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="1.2.2"
-readonly SELF_REPO="springvip/vps-mgr"
+readonly SCRIPT_VERSION="1.2.3"
+readonly SELF_REPO="Bud668/xanmod-bbr-optimizer"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
 readonly CACHE_FILE="$WORK_DIR/server_info.cache"
